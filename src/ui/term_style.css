@@ -1,3 +1,9 @@
 body {
-    background-color: red;
+    background-color: black;
+    margin: 0;
+}
+
+py-terminal {
+    width: 100vw;
+    height: 100vh;
 }

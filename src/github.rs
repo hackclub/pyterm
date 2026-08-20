@@ -38,7 +38,14 @@ pub async fn get_file_in_repo(user: &String, repo: &String, file_path: &String) 
 }
 
 pub async fn get_python_code(user: &String, repo: &String) -> Result<String> {
-    let files_as_priority = ["game.py", "main.py", "folktale.py", "folktale_game.py"];
+    let repo_python_file = format!("{repo}.py");
+    let files_as_priority = [
+        "game.py",
+        "main.py",
+        "folktale.py",
+        "folktale_game.py",
+        repo_python_file.as_str(),
+    ];
     let files = get_repo_files(user, repo).await?;
     let mut path = None;
     for query in files_as_priority {
