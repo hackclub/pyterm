@@ -1,9 +1,7 @@
 pub mod github;
 
 use actix_web::{
-    App, HttpRequest, HttpResponse, HttpServer, Responder,
-    http::header,
-    middleware::DefaultHeaders,
+    App, HttpRequest, HttpResponse, HttpServer, Responder, http::header, middleware::DefaultHeaders,
 };
 
 use crate::github::get_python_code;
@@ -18,6 +16,7 @@ async fn dispatch(req: HttpRequest) -> impl Responder {
         .collect::<Vec<_>>();
 
     if terms.len() < 2 {
+        eprintln!("Invalid path: {}", path);
         return HttpResponse::Ok().body("Invalid path");
     }
 
@@ -26,11 +25,15 @@ async fn dispatch(req: HttpRequest) -> impl Responder {
     if terms.len() != 0 {
         match *terms.last().unwrap() {
             "term_style.css" => return HttpResponse::Ok().body(include_str!("ui/term_style.css")),
+            "term_config.js" => return HttpResponse::Ok().body(include_str!("ui/term_config.js")),
             "conf.json" => return HttpResponse::Ok().body("{}"),
             "script.py" => {
                 let python_code = match get_python_code(&user, &repo).await {
                     Ok(code) => code,
-                    Err(e) => return HttpResponse::Ok().body(format!("Error: {}", e)),
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        return HttpResponse::Ok().body(format!("Error: {}", e));
+                    }
                 };
                 return HttpResponse::Ok().body(python_code);
             }
