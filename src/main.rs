@@ -215,7 +215,7 @@ async fn main() -> std::io::Result<()> {
             )
             .default_service(actix_web::web::to(dispatch))
     })
-    .bind(("127.0.0.1", 8080))?
+    .bind(("0.0.0.0", 8080))?
     .run()
     .await
 }
