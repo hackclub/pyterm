@@ -17,11 +17,13 @@ static CONNECTIONS: OnceLock<Mutex<Vec<(String, Instant)>>> = OnceLock::new();
 static RATE_LIMITED: OnceLock<Mutex<Vec<(String, Instant)>>> = OnceLock::new();
 static RATE_LIMITED_THIS_INSTANCE: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static PEER_CONNECTIONS: OnceLock<Mutex<Vec<(String, Instant)>>> = OnceLock::new();
+static PEER_RATE_LIMITED: OnceLock<Mutex<Vec<(String, Instant)>>> = OnceLock::new();
 
 const MAX_PER_TEN_SECONDS: u32 = 70; // ten full page loads
 const MAX_PER_TEN_SECONDS_PEER: u32 = 700; // one hundred full page loads
 const RATE_LIMIT_MINUTES_FIRST: u64 = 1;
 const RATE_LIMIT_MINUTES_SECOND: u64 = 30;
+const RATE_LIMIT_MINUTES_PEER: u64 = 5;
 
 fn escape_html(input: &str) -> String {
     input
@@ -55,6 +57,23 @@ async fn dispatch(req: HttpRequest) -> impl Responder {
             eprintln!("forwarded ip {ip} claimed by peer {peer_ip}");
         }
 
+        let mut peer_rate_limits = extract_global(&PEER_RATE_LIMITED);
+
+        *peer_rate_limits = peer_rate_limits
+            .iter()
+            .filter(|x| {
+                std::time::Instant::now().duration_since(x.1).as_secs()
+                    < RATE_LIMIT_MINUTES_PEER * 60
+            })
+            .map(|x| (x.0.clone(), x.1))
+            .collect::<Vec<_>>();
+
+        if peer_rate_limits.iter().any(|x| x.0 == peer_ip) {
+            return HttpResponse::TooManyRequests()
+                .content_type("text/plain; charset=utf-8")
+                .body("rate limited, please wait");
+        }
+
         let mut peer_connections = extract_global(&PEER_CONNECTIONS);
         *peer_connections = peer_connections
             .iter()
@@ -64,6 +83,7 @@ async fn dispatch(req: HttpRequest) -> impl Responder {
 
         let peer_count = peer_connections.iter().filter(|x| x.0 == peer_ip).count() as u32;
         if peer_count >= MAX_PER_TEN_SECONDS_PEER {
+            peer_rate_limits.push((peer_ip, std::time::Instant::now()));
             return HttpResponse::TooManyRequests()
                 .content_type("text/plain; charset=utf-8")
                 .body("rate limited, please wait");
@@ -112,7 +132,7 @@ async fn dispatch(req: HttpRequest) -> impl Responder {
 
         rate_limited_this_instance.extend(expired);
 
-        if rate_limited.iter().find(|x| x.0 == ip).is_some() {
+        if rate_limited.iter().any(|x| x.0 == ip) {
             return HttpResponse::TooManyRequests()
                 .content_type("text/plain; charset=utf-8")
                 .body("rate limited, please wait");
