@@ -26,6 +26,8 @@ const fit = () => {
   if (cols !== xterm.cols || rows !== xterm.rows) xterm.resize(cols, rows);
 };
 
+requestAnimationFrame(fit)
+
 window.addEventListener("resize", () => {
   if (pending) return;
   pending = true;
