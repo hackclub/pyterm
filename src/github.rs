@@ -89,13 +89,21 @@ pub async fn get_file_in_repo(user: &String, repo: &String, file_path: &String) 
     Ok(send_github_request(&url).await?)
 }
 
-pub async fn get_python_code(user: &String, repo: &String) -> Result<String> {
+pub async fn get_python_code(user: &String, repo: &String, file: Option<&str>) -> Result<String> {
+    if let Some(file) = file {
+        if file.split('/').any(|x| x == "..") {
+            return Ok("Invalid file path".to_string());
+        }
+        return get_file_in_repo(user, repo, &file.to_string()).await;
+    }
+
     let repo_python_file = format!("{repo}.py");
     let files_as_priority = [
         "game.py",
         "main.py",
         "folktale.py",
         "folktale_game.py",
+        "folktale-game.py",
         repo_python_file.as_str(),
     ];
     let files = get_repo_files(user, repo).await?;

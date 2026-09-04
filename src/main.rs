@@ -1,17 +1,20 @@
 pub mod github;
 
 use std::{
+    collections::HashMap,
     sync::{Mutex, MutexGuard, OnceLock},
     time::Instant,
 };
 
 use actix_web::{
     App, HttpRequest, HttpResponse, HttpServer, Responder, http::header, middleware::DefaultHeaders,
+    web,
 };
 
 use crate::github::get_python_code;
 
 const PAGE_HTML: &str = include_str!("ui/page.html");
+const EXPLAINER_HTML: &str = include_str!("ui/explainer.html");
 
 static CONNECTIONS: OnceLock<Mutex<Vec<(String, Instant)>>> = OnceLock::new();
 static RATE_LIMITED: OnceLock<Mutex<Vec<(String, Instant)>>> = OnceLock::new();
@@ -25,6 +28,35 @@ const RATE_LIMIT_MINUTES_FIRST: u64 = 1;
 const RATE_LIMIT_MINUTES_SECOND: u64 = 30;
 const RATE_LIMIT_MINUTES_PEER: u64 = 5;
 
+fn python_string_literal(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 2);
+    out.push('"');
+    for c in input.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+// exit()/quit() at the end of a script raises SystemExit, which the runtime
+// otherwise reports as an uncaught traceback even though it's a normal exit.
+fn wrap_python_code(code: &str) -> String {
+    // MicroPython doesn't normalize CRLF/CR line endings the way CPython does,
+    // so files with Windows-style newlines render garbled in the terminal.
+    let code = code.replace("\r\n", "\n").replace('\r', "\n");
+    format!(
+        "try:\n    exec(compile({}, \"script.py\", \"exec\"))\nexcept SystemExit:\n    pass\n",
+        python_string_literal(&code)
+    )
+}
+
 fn escape_html(input: &str) -> String {
     input
         .replace("&", "&amp;")
@@ -32,6 +64,14 @@ fn escape_html(input: &str) -> String {
         .replace(">", "&gt;")
         .replace("\"", "&quot;")
         .replace("'", "&#39;")
+}
+
+fn query_param(req: &HttpRequest, key: &str) -> Option<String> {
+    web::Query::<HashMap<String, String>>::from_query(req.query_string())
+        .ok()?
+        .into_inner()
+        .remove(key)
+        .filter(|x| !x.is_empty())
 }
 
 fn extract_global<'a, T>(input: &'a OnceLock<Mutex<Vec<T>>>) -> MutexGuard<'a, Vec<T>> {
@@ -168,6 +208,12 @@ async fn dispatch(req: HttpRequest) -> impl Responder {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>();
 
+    if terms.is_empty() {
+        return HttpResponse::Ok()
+            .content_type("text/html; charset=utf-8")
+            .body(EXPLAINER_HTML);
+    }
+
     if terms.len() < 2 {
         eprintln!("Invalid path: {}", path);
         return HttpResponse::Ok()
@@ -177,6 +223,7 @@ async fn dispatch(req: HttpRequest) -> impl Responder {
 
     let user = terms[0].to_string();
     let repo = terms[1].to_string();
+    let file = query_param(&req, "file");
     if terms.len() != 0 {
         match *terms.last().unwrap() {
             "term_style.css" => {
@@ -192,10 +239,16 @@ async fn dispatch(req: HttpRequest) -> impl Responder {
             "conf.json" => {
                 return HttpResponse::Ok()
                     .content_type("application/json")
-                    .body("{}");
+                    .body(serde_json::json!({ "packages": Vec::<&str>::new() }).to_string());
+            }
+            "script.py" if user == "__test" => {
+                let python_code = "print(\"line one\")\nprint(\"line two\")\nfor i in range(5):\n    print(i)\nexit()\n".to_string();
+                return HttpResponse::Ok()
+                    .content_type("text/plain; charset=utf-8")
+                    .body(wrap_python_code(&python_code));
             }
             "script.py" => {
-                let python_code = match get_python_code(&user, &repo).await {
+                let python_code = match get_python_code(&user, &repo, file.as_deref()).await {
                     Ok(code) => code,
                     Err(e) => {
                         eprintln!("Error: {}", e);
@@ -206,11 +259,16 @@ async fn dispatch(req: HttpRequest) -> impl Responder {
                 };
                 return HttpResponse::Ok()
                     .content_type("text/plain; charset=utf-8")
-                    .body(python_code);
+                    .body(wrap_python_code(&python_code));
             }
             _ => {}
         }
     }
+
+    let query = match req.query_string() {
+        "" => String::new(),
+        q => format!("?{}", escape_html(q)),
+    };
 
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
@@ -218,7 +276,9 @@ async fn dispatch(req: HttpRequest) -> impl Responder {
             PAGE_HTML
                 .replace("{PAGE_TITLE}", &escape_html(&repo))
                 .replace("{USER}", &escape_html(&user))
-                .replace("{REPO}", &escape_html(&repo)),
+                .replace("{REPO}", &escape_html(&repo))
+                .replace("{RUNTIME}", "py")
+                .replace("{QUERY}", &query),
         )
 }
 
