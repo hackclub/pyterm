@@ -48,6 +48,7 @@
               cargo
               rustfmt
               rust-src
+              rust-analyzer
             ]
           );
       };
@@ -63,7 +64,6 @@
               cargo-deny
               cargo-edit
               cargo-watch
-              rust-analyzer
               self.formatter.${system}
             ];
 

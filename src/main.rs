@@ -236,11 +236,6 @@ async fn dispatch(req: HttpRequest) -> impl Responder {
                     .content_type("text/javascript; charset=utf-8")
                     .body(include_str!("ui/term_config.js"));
             }
-            "conf.json" => {
-                return HttpResponse::Ok()
-                    .content_type("application/json")
-                    .body(serde_json::json!({ "packages": Vec::<&str>::new() }).to_string());
-            }
             "script.py" if user == "__test" => {
                 let python_code = "print(\"line one\")\nprint(\"line two\")\nfor i in range(5):\n    print(i)\nexit()\n".to_string();
                 return HttpResponse::Ok()
@@ -270,6 +265,18 @@ async fn dispatch(req: HttpRequest) -> impl Responder {
         q => format!("?{}", escape_html(q)),
     };
 
+    // PyScript only fetches a worker's config URL if it ends in .json/.toml,
+    // so a query string can't be used; the config is inlined instead.
+    let packages = query_param(&req, "packages")
+        .map(|x| {
+            x.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let config = serde_json::json!({ "packages": packages }).to_string();
+
     HttpResponse::Ok()
         .content_type("text/html; charset=utf-8")
         .body(
@@ -278,6 +285,7 @@ async fn dispatch(req: HttpRequest) -> impl Responder {
                 .replace("{USER}", &escape_html(&user))
                 .replace("{REPO}", &escape_html(&repo))
                 .replace("{RUNTIME}", "py")
+                .replace("{CONFIG}", &escape_html(&config))
                 .replace("{QUERY}", &query),
         )
 }
