@@ -2,6 +2,7 @@ pub mod github;
 
 use std::{
     collections::HashMap,
+    net::IpAddr,
     sync::{Mutex, MutexGuard, OnceLock},
     time::Instant,
 };
@@ -19,14 +20,10 @@ const EXPLAINER_HTML: &str = include_str!("ui/explainer.html");
 static CONNECTIONS: OnceLock<Mutex<Vec<(String, Instant)>>> = OnceLock::new();
 static RATE_LIMITED: OnceLock<Mutex<Vec<(String, Instant)>>> = OnceLock::new();
 static RATE_LIMITED_THIS_INSTANCE: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
-static PEER_CONNECTIONS: OnceLock<Mutex<Vec<(String, Instant)>>> = OnceLock::new();
-static PEER_RATE_LIMITED: OnceLock<Mutex<Vec<(String, Instant)>>> = OnceLock::new();
 
 const MAX_PER_TEN_SECONDS: u32 = 70; // ten full page loads
-const MAX_PER_TEN_SECONDS_PEER: u32 = 700; // one hundred full page loads
 const RATE_LIMIT_MINUTES_FIRST: u64 = 1;
 const RATE_LIMIT_MINUTES_SECOND: u64 = 30;
-const RATE_LIMIT_MINUTES_PEER: u64 = 5;
 
 fn python_string_literal(input: &str) -> String {
     let mut out = String::with_capacity(input.len() + 2);
@@ -47,12 +44,14 @@ fn python_string_literal(input: &str) -> String {
 
 // exit()/quit() at the end of a script raises SystemExit, which the runtime
 // otherwise reports as an uncaught traceback even though it's a normal exit.
+// PyScript's terminal swaps input() for xterm-readline's read(), which throws
+// when called without a prompt, so input() is wrapped to always pass a string.
 fn wrap_python_code(code: &str) -> String {
     // MicroPython doesn't normalize CRLF/CR line endings the way CPython does,
     // so files with Windows-style newlines render garbled in the terminal.
     let code = code.replace("\r\n", "\n").replace('\r', "\n");
     format!(
-        "try:\n    exec(compile({}, \"script.py\", \"exec\"))\nexcept SystemExit:\n    pass\n",
+        "import builtins as _b\n_b.input = (lambda read: lambda prompt=\"\": read(str(prompt)))(_b.input)\ndel _b\ntry:\n    exec(compile({}, \"script.py\", \"exec\"))\nexcept SystemExit:\n    pass\n",
         python_string_literal(&code)
     )
 }
@@ -74,6 +73,40 @@ fn query_param(req: &HttpRequest, key: &str) -> Option<String> {
         .filter(|x| !x.is_empty())
 }
 
+// Behind the cluster ingress the peer is a private pod IP and the client is the
+// rightmost X-Forwarded-For entry, the one the ingress added. Everything else in
+// that header, or the header from any other peer, is client-controlled.
+fn client_ip(req: &HttpRequest) -> String {
+    let peer = req.peer_addr().map(|x| x.ip());
+    let behind_proxy = peer.is_some_and(|ip| match ip {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_loopback(),
+        IpAddr::V6(ip) => ip.is_unique_local() || ip.is_loopback(),
+    });
+
+    if behind_proxy {
+        if let Some(ip) = req
+            .headers()
+            .get_all(header::X_FORWARDED_FOR)
+            .last()
+            .and_then(|x| x.to_str().ok())
+            .and_then(|x| x.rsplit(',').next())
+            .map(str::trim)
+            .filter(|x| !x.is_empty())
+        {
+            return ip.to_string();
+        }
+    }
+
+    peer.map(|x| x.to_string()).unwrap_or_default()
+}
+
+// Only bare names (optionally with a version specifier), so a link can't make a
+// page load wheels or configs from an arbitrary URL.
+fn valid_package(name: &str) -> bool {
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_.=<>!~[]".contains(c))
+}
+
 fn extract_global<'a, T>(input: &'a OnceLock<Mutex<Vec<T>>>) -> MutexGuard<'a, Vec<T>> {
     input
         .get_or_init(|| Mutex::new(vec![]))
@@ -83,53 +116,7 @@ fn extract_global<'a, T>(input: &'a OnceLock<Mutex<Vec<T>>>) -> MutexGuard<'a, V
 
 async fn dispatch(req: HttpRequest) -> impl Responder {
     {
-        let ip = req
-            .connection_info()
-            .realip_remote_addr()
-            .map(|x| x.to_string())
-            .unwrap_or(String::new());
-
-        let peer_ip = req
-            .peer_addr()
-            .map(|x| x.ip().to_string())
-            .unwrap_or(String::new());
-        if ip != peer_ip {
-            eprintln!("forwarded ip {ip} claimed by peer {peer_ip}");
-        }
-
-        let mut peer_rate_limits = extract_global(&PEER_RATE_LIMITED);
-
-        *peer_rate_limits = peer_rate_limits
-            .iter()
-            .filter(|x| {
-                std::time::Instant::now().duration_since(x.1).as_secs()
-                    < RATE_LIMIT_MINUTES_PEER * 60
-            })
-            .map(|x| (x.0.clone(), x.1))
-            .collect::<Vec<_>>();
-
-        if peer_rate_limits.iter().any(|x| x.0 == peer_ip) {
-            return HttpResponse::TooManyRequests()
-                .content_type("text/plain; charset=utf-8")
-                .body("rate limited, please wait");
-        }
-
-        let mut peer_connections = extract_global(&PEER_CONNECTIONS);
-        *peer_connections = peer_connections
-            .iter()
-            .filter(|x| std::time::Instant::now().duration_since(x.1).as_secs() < 10)
-            .map(|x| (x.0.clone(), x.1))
-            .collect::<Vec<_>>();
-
-        let peer_count = peer_connections.iter().filter(|x| x.0 == peer_ip).count() as u32;
-        if peer_count >= MAX_PER_TEN_SECONDS_PEER {
-            peer_rate_limits.push((peer_ip, std::time::Instant::now()));
-            return HttpResponse::TooManyRequests()
-                .content_type("text/plain; charset=utf-8")
-                .body("rate limited, please wait");
-        }
-
-        peer_connections.push((peer_ip, std::time::Instant::now()));
+        let ip = client_ip(&req);
 
         let mut rate_limited = extract_global(&RATE_LIMITED);
 
@@ -271,7 +258,7 @@ async fn dispatch(req: HttpRequest) -> impl Responder {
         .map(|x| {
             x.split(',')
                 .map(|p| p.trim().to_string())
-                .filter(|p| !p.is_empty())
+                .filter(|p| !p.is_empty() && valid_package(p))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();

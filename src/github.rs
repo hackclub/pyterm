@@ -4,8 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Ok, Result};
-use reqwest::Client;
+use anyhow::{Result, anyhow, bail};
+use reqwest::{Client, Response, Url};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -26,15 +26,25 @@ pub struct GithubRepoResponse {
     tree: Vec<GithubPathEntry>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct GithubRepoInfo {
+    private: bool,
+}
+
 fn github_token() -> Result<String> {
     std::env::var("GITHUB_TOKEN").map_err(|_| anyhow::anyhow!("github credentials unavailable"))
 }
 
+// Client errors are cached too so repeated bad lookups don't spend API quota.
+type CacheEntry = (std::result::Result<String, String>, Instant);
+
 static CLIENT: OnceLock<Client> = OnceLock::new();
-static CACHE: OnceLock<Mutex<HashMap<String, (String, Instant)>>> = OnceLock::new();
+static CACHE: OnceLock<Mutex<HashMap<String, CacheEntry>>> = OnceLock::new();
 
 const REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const CACHE_SECONDS: u64 = 300;
+const MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
+const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 fn github_client() -> Result<&'static Client> {
     if let Some(client) = CLIENT.get() {
@@ -49,49 +59,125 @@ fn github_client() -> Result<&'static Client> {
     Ok(CLIENT.get_or_init(|| client))
 }
 
-pub async fn send_github_request(url: &str) -> Result<String> {
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+async fn read_limited(mut response: Response) -> Result<std::result::Result<String, String>> {
+    let too_large = Err(format!("response larger than {MAX_RESPONSE_BYTES} bytes"));
+    if response
+        .content_length()
+        .is_some_and(|x| x > MAX_RESPONSE_BYTES as u64)
+    {
+        return Ok(too_large);
+    }
 
-    if let Some((data, stored_at)) = cache.lock().await.get(url) {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Ok(too_large);
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(Ok(String::from_utf8_lossy(&body).into_owned()))
+}
+
+pub async fn send_github_request(url: Url) -> Result<String> {
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = url.to_string();
+
+    if let Some((data, stored_at)) = cache.lock().await.get(&key) {
         if Instant::now().duration_since(*stored_at).as_secs() < CACHE_SECONDS {
-            return Ok(data.clone());
+            return data.clone().map_err(|e| anyhow!(e));
         }
     }
 
-    let output = github_client()?
+    let response = github_client()?
         .get(url)
         .bearer_auth(github_token()?)
         .send()
-        .await?
-        .error_for_status()?
-        .text()
         .await?;
+    let output = if response.status().is_client_error() {
+        Err(format!("github returned {}", response.status()))
+    } else {
+        read_limited(response.error_for_status()?).await?
+    };
+
+    let entry_size =
+        |k: &String, x: &CacheEntry| k.len() + x.0.as_ref().map_or_else(String::len, String::len);
 
     let mut handle = cache.lock().await;
     handle.retain(|_, x| Instant::now().duration_since(x.1).as_secs() < CACHE_SECONDS);
-    handle.insert(url.to_string(), (output.clone(), Instant::now()));
+    let new_entry = (output.clone(), Instant::now());
+    let mut total =
+        entry_size(&key, &new_entry) + handle.iter().map(|(k, x)| entry_size(k, x)).sum::<usize>();
+    while total > MAX_CACHE_BYTES {
+        let Some(oldest) = handle
+            .iter()
+            .min_by_key(|(_, x)| x.1)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        if let Some(removed) = handle.remove(&oldest) {
+            total -= entry_size(&oldest, &removed);
+        }
+    }
+    handle.insert(key, new_entry);
 
-    Ok(output)
+    output.map_err(|e| anyhow!(e))
+}
+
+fn github_url(base: &str, segments: &[&str]) -> Result<Url> {
+    let mut url = Url::parse(base)?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow!("invalid base url"))?
+        .extend(segments);
+    Ok(url)
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+}
+
+// The token may be able to see private repos, so only public ones are served.
+async fn ensure_public(user: &str, repo: &str) -> Result<()> {
+    let url = github_url("https://api.github.com/repos", &[user, repo])?;
+    let info: GithubRepoInfo = serde_json::from_str(&send_github_request(url).await?)?;
+    if info.private {
+        bail!("{user}/{repo} is private");
+    }
+    Ok(())
 }
 
 pub async fn get_repo_files(user: &String, repo: &String) -> Result<Vec<String>> {
-    let url = format!("https://api.github.com/repos/{user}/{repo}/git/trees/HEAD?recursive=1");
-    let response: GithubRepoResponse = serde_json::from_str(&send_github_request(&url).await?)?;
+    let mut url = github_url(
+        "https://api.github.com/repos",
+        &[user, repo, "git", "trees", "HEAD"],
+    )?;
+    url.set_query(Some("recursive=1"));
+    let response: GithubRepoResponse = serde_json::from_str(&send_github_request(url).await?)?;
 
     Ok(response.tree.iter().map(|x| x.path.clone()).collect())
 }
 
 pub async fn get_file_in_repo(user: &String, repo: &String, file_path: &String) -> Result<String> {
-    let url = format!(
-        "https://raw.githubusercontent.com/{user}/{repo}/HEAD/{}",
-        file_path.trim_start_matches("/")
-    );
-    Ok(send_github_request(&url).await?)
+    let mut segments = vec![user.as_str(), repo.as_str(), "HEAD"];
+    segments.extend(file_path.split('/').filter(|x| !x.is_empty()));
+    let url = github_url("https://raw.githubusercontent.com", &segments)?;
+    send_github_request(url).await
 }
 
 pub async fn get_python_code(user: &String, repo: &String, file: Option<&str>) -> Result<String> {
+    if !valid_name(user) || !valid_name(repo) {
+        bail!("invalid repository {user}/{repo}");
+    }
+    ensure_public(user, repo).await?;
+
     if let Some(file) = file {
-        if file.split('/').any(|x| x == "..") {
+        if file.split('/').any(|x| x == ".." || x == ".") {
             return Ok("Invalid file path".to_string());
         }
         return get_file_in_repo(user, repo, &file.to_string()).await;

@@ -11,3 +11,8 @@ reqwest = { version = "0.13.4", features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+
+# Backport of the actix-http 3.12.1 request smuggling fix (GHSA CL.TE), since
+# 3.12.x requires Rust 1.88. Remove once rust-version can be raised.
+[patch.crates-io]
+actix-http = { path = "vendor/actix-http" }
