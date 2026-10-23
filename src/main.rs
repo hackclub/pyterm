@@ -212,7 +212,7 @@ async fn dispatch(req: HttpRequest) -> impl Responder {
     let repo = terms[1].to_string();
     let file = query_param(&req, "file");
     if terms.len() != 0 {
-        match *terms.last().unwrap() {
+        match terms.last().unwrap().to_ascii_lowercase().as_str() {
             "term_style.css" => {
                 return HttpResponse::Ok()
                     .content_type("text/css; charset=utf-8")
