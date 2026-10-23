@@ -203,7 +203,10 @@ pub async fn get_python_code(user: &String, repo: &String, file: Option<&str>) -
     }
 
     if path.is_none() {
-        path = files.iter().find(|x| x.ends_with(".py")).cloned();
+        path = files
+            .iter()
+            .find(|x| x.to_ascii_lowercase().ends_with(".py"))
+            .cloned();
     }
 
     if path.is_none() {
