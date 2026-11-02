@@ -37,9 +37,10 @@ fn github_token() -> Result<String> {
 
 // Client errors are cached too so repeated bad lookups don't spend API quota.
 type CacheEntry = (std::result::Result<String, String>, Instant);
+pub(crate) type Cache = OnceLock<Mutex<HashMap<String, CacheEntry>>>;
 
 static CLIENT: OnceLock<Client> = OnceLock::new();
-static CACHE: OnceLock<Mutex<HashMap<String, CacheEntry>>> = OnceLock::new();
+static CACHE: Cache = OnceLock::new();
 
 const REQUEST_TIMEOUT_SECONDS: u64 = 30;
 const CACHE_SECONDS: u64 = 300;
@@ -79,8 +80,13 @@ async fn read_limited(mut response: Response) -> Result<std::result::Result<Stri
     Ok(Ok(String::from_utf8_lossy(&body).into_owned()))
 }
 
-pub async fn send_github_request(url: Url) -> Result<String> {
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+pub(crate) async fn send_request(
+    client: &Client,
+    cache: &Cache,
+    url: Url,
+    token: Option<String>,
+) -> Result<String> {
+    let cache = cache.get_or_init(|| Mutex::new(HashMap::new()));
     let key = url.to_string();
 
     if let Some((data, stored_at)) = cache.lock().await.get(&key) {
@@ -89,13 +95,13 @@ pub async fn send_github_request(url: Url) -> Result<String> {
         }
     }
 
-    let response = github_client()?
-        .get(url)
-        .bearer_auth(github_token()?)
-        .send()
-        .await?;
+    let mut request = client.get(url);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await?;
     let output = if response.status().is_client_error() {
-        Err(format!("github returned {}", response.status()))
+        Err(format!("server returned {}", response.status()))
     } else {
         read_limited(response.error_for_status()?).await?
     };
@@ -123,6 +129,10 @@ pub async fn send_github_request(url: Url) -> Result<String> {
     handle.insert(key, new_entry);
 
     output.map_err(|e| anyhow!(e))
+}
+
+pub async fn send_github_request(url: Url) -> Result<String> {
+    send_request(github_client()?, &CACHE, url, Some(github_token()?)).await
 }
 
 fn github_url(base: &str, segments: &[&str]) -> Result<Url> {

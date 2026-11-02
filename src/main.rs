@@ -1,3 +1,4 @@
+pub mod download;
 pub mod github;
 
 use std::{
@@ -12,7 +13,10 @@ use actix_web::{
     web,
 };
 
-use crate::github::get_python_code;
+use crate::{
+    download::{download_title, get_download},
+    github::get_python_code,
+};
 
 const PAGE_HTML: &str = include_str!("ui/page.html");
 const EXPLAINER_HTML: &str = include_str!("ui/explainer.html");
@@ -195,21 +199,30 @@ async fn dispatch(req: HttpRequest) -> impl Responder {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>();
 
-    if terms.is_empty() {
+    let dl_url = query_param(&req, "dl_url");
+
+    if terms.is_empty() && dl_url.is_none() {
         return HttpResponse::Ok()
             .content_type("text/html; charset=utf-8")
             .body(EXPLAINER_HTML);
     }
 
-    if terms.len() < 2 {
+    if terms.len() == 1 {
         eprintln!("Invalid path: {}", path);
         return HttpResponse::Ok()
             .content_type("text/plain; charset=utf-8")
             .body("Invalid path");
     }
 
-    let user = terms[0].to_string();
-    let repo = terms[1].to_string();
+    // GitHub usernames can't start with an underscore, so "__dl" can't collide.
+    let (user, repo, title) = match (terms.as_slice(), &dl_url) {
+        ([], Some(url)) => ("__dl".to_string(), "url".to_string(), download_title(url)),
+        _ => (
+            terms[0].to_string(),
+            terms[1].to_string(),
+            terms[1].to_string(),
+        ),
+    };
     let file = query_param(&req, "file");
     if terms.len() != 0 {
         match terms.last().unwrap().to_ascii_lowercase().as_str() {
@@ -225,6 +238,20 @@ async fn dispatch(req: HttpRequest) -> impl Responder {
             }
             "script.py" if user == "__test" => {
                 let python_code = "print(\"line one\")\nprint(\"line two\")\nfor i in range(5):\n    print(i)\nexit()\n".to_string();
+                return HttpResponse::Ok()
+                    .content_type("text/plain; charset=utf-8")
+                    .body(wrap_python_code(&python_code));
+            }
+            "script.py" if user == "__dl" => {
+                let python_code = match get_download(dl_url.as_deref().unwrap_or_default()).await {
+                    Ok(code) => code,
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        return HttpResponse::InternalServerError()
+                            .content_type("text/plain; charset=utf-8")
+                            .body("Internal server error");
+                    }
+                };
                 return HttpResponse::Ok()
                     .content_type("text/plain; charset=utf-8")
                     .body(wrap_python_code(&python_code));
@@ -268,7 +295,7 @@ async fn dispatch(req: HttpRequest) -> impl Responder {
         .content_type("text/html; charset=utf-8")
         .body(
             PAGE_HTML
-                .replace("{PAGE_TITLE}", &escape_html(&repo))
+                .replace("{PAGE_TITLE}", &escape_html(&title))
                 .replace("{USER}", &escape_html(&user))
                 .replace("{REPO}", &escape_html(&repo))
                 .replace("{RUNTIME}", "py")
