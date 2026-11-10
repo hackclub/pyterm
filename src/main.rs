@@ -9,8 +9,8 @@ use std::{
 };
 
 use actix_web::{
-    App, HttpRequest, HttpResponse, HttpServer, Responder, http::header, middleware::DefaultHeaders,
-    web,
+    App, HttpRequest, HttpResponse, HttpServer, Responder, http::header,
+    middleware::DefaultHeaders, web,
 };
 
 use crate::{
@@ -205,6 +205,13 @@ async fn dispatch(req: HttpRequest) -> impl Responder {
         return HttpResponse::Ok()
             .content_type("text/html; charset=utf-8")
             .body(EXPLAINER_HTML);
+    }
+
+    // coincident 4.1.1's service worker; replaces SharedArrayBuffer in iframes.
+    if terms == ["sw.js"] {
+        return HttpResponse::Ok()
+            .content_type("text/javascript; charset=utf-8")
+            .body(include_str!("ui/sw.js"));
     }
 
     if terms.len() == 1 {
